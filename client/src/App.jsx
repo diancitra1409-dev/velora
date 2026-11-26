@@ -4,7 +4,10 @@ import BookSearchPanel from './components/BookSearchPanel';
 import ChatPanel from './components/ChatPanel';
 import ManualBookModal from './components/ManualBookModal';
 import MeteorShower from './components/MeteorShower';
-import { parseFriendlyError } from './utils/errorParser';
+import {
+  buildHttpErrorFromResponse,
+  parseFriendlyError,
+} from './utils/errorParser';
 import { searchBooks } from './utils/bookSearch';
 
 const GENERAL_THREAD_KEY = '__general__';
@@ -172,16 +175,11 @@ export default function App() {
         }),
       });
 
-      const contentType = response.headers.get('content-type') || '';
-      const payload = contentType.includes('application/json')
-        ? await response.json()
-        : { error: { message: await response.text() } };
-
       if (!response.ok) {
-        throw new Error(
-          parseFriendlyError(payload, 'Unable to get a response from Velora AI.')
-        );
+        throw await buildHttpErrorFromResponse(response);
       }
+
+      const payload = await response.json();
 
       const assistantMsg = {
         id: `model-${Date.now()}`,

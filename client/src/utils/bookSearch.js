@@ -1,3 +1,5 @@
+import { ApiHttpError } from './errorParser.js';
+
 const GOOGLE_BOOKS_SEARCH_URL = 'https://www.googleapis.com/books/v1/volumes';
 const OPEN_LIBRARY_SEARCH_URL = 'https://openlibrary.org/search.json';
 const OPEN_LIBRARY_FIELDS = [
@@ -153,7 +155,11 @@ async function fetchGoogleBooks({ query, filter, maxResults = 12, signal }) {
   });
 
   if (!response.ok) {
-    throw new Error(`Google Books returned status ${response.status}`);
+    throw new ApiHttpError(
+      response.status,
+      `Google Books returned status ${response.status}`,
+      response.statusText
+    );
   }
 
   const data = await response.json();
@@ -183,7 +189,11 @@ async function fetchOpenLibrary({ query, filter, signal }) {
   });
 
   if (!response.ok) {
-    throw new Error(`Open Library returned status ${response.status}`);
+    throw new ApiHttpError(
+      response.status,
+      `Open Library returned status ${response.status}`,
+      response.statusText
+    );
   }
 
   const data = await response.json();
@@ -264,7 +274,17 @@ async function runHybridPass({ query, filter, googleMaxResults = 12, signal }) {
       abortErr.name = 'AbortError';
       throw abortErr;
     }
-    throw new Error('Could not reach Google Books or Open Library. Please try again.');
+
+    const bothNetworkFailures =
+      googleResult.reason instanceof TypeError &&
+      openLibResult.reason instanceof TypeError;
+
+    if (bothNetworkFailures) {
+      throw new TypeError('Failed to fetch book catalog');
+    }
+
+    // Surface HTTP status / error details if one or both APIs responded with HTTP errors
+    throw openLibResult.reason || googleResult.reason;
   }
 
   const googleBooks = googleOk ? googleResult.value.books : [];

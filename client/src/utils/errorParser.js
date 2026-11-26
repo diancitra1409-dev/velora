@@ -1,4 +1,17 @@
 /**
+ * Represents an HTTP error response returned by a reachable backend/API server.
+ */
+export class ApiHttpError extends Error {
+  constructor(status, message, statusText = '') {
+    super(message || `HTTP ${status}`);
+    this.name = 'ApiHttpError';
+    this.status = status;
+    this.statusText = statusText;
+    this.isHttpError = true;
+  }
+}
+
+/**
  * Recursively unwrap JSON-encoded error payloads or strings so users never see raw JSON.
  */
 function extractMessageFromUnknown(input, depth = 0) {
@@ -7,6 +20,11 @@ function extractMessageFromUnknown(input, depth = 0) {
   if (typeof input === 'string') {
     const trimmed = input.trim();
     if (!trimmed) return '';
+
+    // Strip HTML error pages (e.g. proxy 502/404 HTML) rather than leaking markup
+    if (/^<!doctype\s+html|^<html[\s>]/i.test(trimmed)) {
+      return '';
+    }
 
     // Check if string looks like JSON (object or array)
     if (
@@ -18,7 +36,6 @@ function extractMessageFromUnknown(input, depth = 0) {
         const extracted = extractMessageFromUnknown(parsed, depth + 1);
         if (extracted) return extracted;
       } catch {
-        // Not valid JSON; strip brace clutter if it contains a message field
         const match = trimmed.match(/"message"\s*:\s*"([^"]+)"/);
         if (match?.[1]) return match[1];
       }
@@ -45,47 +62,66 @@ function extractMessageFromUnknown(input, depth = 0) {
 }
 
 /**
- * Convert raw API, network, or Gemini errors into clean, human-readable messages.
+ * Build an ApiHttpError from a non-OK fetch Response without throwing raw JSON/HTML.
+ */
+export async function buildHttpErrorFromResponse(response) {
+  const contentType = response.headers.get('content-type') || '';
+  let serverMessage = '';
+
+  try {
+    if (contentType.includes('application/json')) {
+      const payload = await response.json();
+      serverMessage = extractMessageFromUnknown(payload);
+    } else {
+      const rawText = await response.text();
+      serverMessage = extractMessageFromUnknown(rawText);
+    }
+  } catch {
+    serverMessage = '';
+  }
+
+  const fallbackByStatus =
+    response.status === 404
+      ? 'API endpoint not found.'
+      : response.status >= 500
+        ? response.statusText || 'Internal server error.'
+        : response.statusText || 'Request failed.';
+
+  return new ApiHttpError(
+    response.status,
+    serverMessage || fallbackByStatus,
+    response.statusText || ''
+  );
+}
+
+/**
+ * Convert network failures (TypeError) vs HTTP errors into clear, human-readable messages.
+ * Only reports "Unable to reach the server" on actual network/fetch failures (TypeError).
  */
 export function parseFriendlyError(err, fallback = 'Something went wrong. Please try again.') {
+  // Actual network / DNS / offline fetch failures
+  if (err instanceof TypeError || err?.isNetworkError === true) {
+    return 'Unable to reach the server. Please check your connection and ensure the API server is running.';
+  }
+
+  const status = typeof err?.status === 'number' ? err.status : null;
   const rawMessage = extractMessageFromUnknown(err) || '';
-  const lower = rawMessage.toLowerCase();
+
+  // HTTP response returned by a reachable backend/API
+  if (err?.isHttpError || status !== null) {
+    const cleanMsg =
+      rawMessage && !(rawMessage.includes('{') && rawMessage.includes('}'))
+        ? rawMessage
+        : fallback;
+
+    if (status && !cleanMsg.includes(String(status))) {
+      return `HTTP ${status}: ${cleanMsg}`;
+    }
+    return cleanMsg;
+  }
 
   if (!rawMessage) {
     return fallback;
-  }
-
-  if (
-    lower.includes('failed to fetch') ||
-    lower.includes('fetch failed') ||
-    lower.includes('networkerror') ||
-    lower.includes('network request failed') ||
-    lower.includes('econnrefused') ||
-    lower.includes('econnreset')
-  ) {
-    return 'Unable to reach the server. Please check your connection and try again.';
-  }
-
-  if (
-    lower.includes('429') ||
-    lower.includes('resource_exhausted') ||
-    lower.includes('rate limit') ||
-    lower.includes('quota')
-  ) {
-    return 'Velora AI is currently receiving too many requests. Please wait a few seconds and try again.';
-  }
-
-  if (
-    lower.includes('503') ||
-    lower.includes('unavailable') ||
-    lower.includes('overloaded') ||
-    lower.includes('high demand')
-  ) {
-    return 'The AI assistant is temporarily busy. Please try again in a moment.';
-  }
-
-  if (lower.includes('api key') || lower.includes('gemini_api_key') || lower.includes('unauthorized')) {
-    return 'Server AI configuration is missing or invalid. Please check GEMINI_API_KEY on the server.';
   }
 
   // Never leak raw JSON braces to the UI

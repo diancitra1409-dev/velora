@@ -15,7 +15,9 @@ app.use(
 );
 app.use(express.json({ limit: '1mb' }));
 
-app.get('/api/health', (_req, res) => {
+const apiRouter = express.Router();
+
+apiRouter.get('/health', (_req, res) => {
   res.json({
     ok: true,
     service: 'velora-api',
@@ -23,7 +25,7 @@ app.get('/api/health', (_req, res) => {
   });
 });
 
-app.post('/api/chat', async (req, res) => {
+apiRouter.post('/chat', async (req, res) => {
   const { message, history, book } = req.body || {};
 
   if (typeof message !== 'string' || !message.trim()) {
@@ -60,7 +62,7 @@ app.post('/api/chat', async (req, res) => {
     const messageText =
       typeof err?.message === 'string' && err.message.trim()
         ? err.message.trim()
-        : 'Unable to reach Velora AI right now. Please try again.';
+        : 'The AI assistant could not process your request right now.';
 
     return res.status(status).json({
       error: {
@@ -70,6 +72,20 @@ app.post('/api/chat', async (req, res) => {
     });
   }
 });
+
+// JSON 404 for unknown API endpoints
+apiRouter.use((req, res) => {
+  res.status(404).json({
+    error: {
+      code: 404,
+      message: `API endpoint not found: ${req.method} ${req.originalUrl}`,
+    },
+  });
+});
+
+// Mount under both /api (local dev + Vercel preserved path) and / (in case a rewrite strips /api)
+app.use('/api', apiRouter);
+app.use('/', apiRouter);
 
 // Clean JSON error handler (e.g., malformed JSON payloads)
 app.use((err, _req, res, _next) => {
