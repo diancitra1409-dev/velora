@@ -90,6 +90,7 @@ function normalizeGoogleVolume(item, index) {
   return {
     id: item?.id ? `gb-${item.id}` : `gb-${info.title || 'book'}-${index}`,
     key: item?.id ? `/google/${item.id}` : '',
+    workKey: '',
     title: info.title?.trim() || 'Untitled Work',
     authors: Array.isArray(info.authors) ? info.authors.slice(0, 3) : [],
     firstPublishYear: extractPublishYear(info.publishedDate),
@@ -119,9 +120,12 @@ function normalizeOpenLibraryDoc(doc, index) {
         .slice(0, 5)
     : [];
 
+  const workKey = typeof doc.key === 'string' && doc.key.startsWith('/works/') ? doc.key : '';
+
   return {
     id: doc.key ? `ol-${doc.key}` : `ol-${doc.title || 'book'}-${index}`,
     key: doc.key || '',
+    workKey,
     title: doc.title?.trim() || 'Untitled Work',
     authors: Array.isArray(doc.author_name) ? doc.author_name.slice(0, 3) : [],
     firstPublishYear: doc.first_publish_year ?? null,
@@ -236,6 +240,7 @@ function mergeAndDeduplicate(googleBooks, openLibraryBooks) {
 
     // Enrich existing prioritized record with any missing metadata from secondary match
     const existing = byKey.get(key);
+    if (!existing.workKey && book.workKey) existing.workKey = book.workKey;
     if (!existing.coverUrl && book.coverUrl) existing.coverUrl = book.coverUrl;
     if (!existing.description && book.description) existing.description = book.description;
     if (!existing.firstSentence && book.firstSentence) existing.firstSentence = book.firstSentence;

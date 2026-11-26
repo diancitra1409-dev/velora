@@ -80,6 +80,7 @@ export default function ChatPanel({
   onToggle,
   onClose,
   selectedBook,
+  isLoadingSynopsis = false,
   onClearBook,
   messages,
   input,
@@ -172,40 +173,58 @@ export default function ChatPanel({
 
           {/* Compact Active Book Banner */}
           {selectedBook ? (
-            <div className="rounded-xl border border-pink-400/35 bg-purple-950/55 p-2 flex items-center gap-2.5">
-              <BookCover
-                coverUrl={selectedBook.coverUrl}
-                title={selectedBook.title}
-                author={selectedBook.authors[0]}
-                size="sm"
-              />
-              <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-1">
-                  <BookMarked className="w-3 h-3 text-pink-400 shrink-0" />
-                  <span className="text-[10px] font-bold uppercase tracking-wider text-pink-300">
-                    Active Book
-                  </span>
+            <div className="rounded-xl border border-pink-400/35 bg-purple-950/55 p-2 space-y-1.5">
+              <div className="flex items-center gap-2.5">
+                <BookCover
+                  coverUrl={selectedBook.coverUrl}
+                  title={selectedBook.title}
+                  author={selectedBook.authors[0]}
+                  size="sm"
+                />
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center justify-between gap-1.5">
+                    <div className="flex items-center gap-1 min-w-0">
+                      <BookMarked className="w-3 h-3 text-pink-400 shrink-0" />
+                      <span className="text-[10px] font-bold uppercase tracking-wider text-pink-300">
+                        Active Book
+                      </span>
+                    </div>
+                    {isLoadingSynopsis ? (
+                      <span className="shrink-0 rounded-full bg-blue-950/80 border border-blue-400/35 px-2 py-0.5 text-[9.5px] font-medium text-blue-200 animate-pulse">
+                        Loading synopsis...
+                      </span>
+                    ) : selectedBook.description ? (
+                      <span className="shrink-0 rounded-full bg-emerald-950/70 border border-emerald-400/35 px-2 py-0.5 text-[9.5px] font-medium text-emerald-200">
+                        Synopsis loaded
+                      </span>
+                    ) : null}
+                  </div>
+                  <p className="font-editorial font-semibold text-xs sm:text-sm text-white truncate">
+                    {selectedBook.title}
+                  </p>
+                  <p className="text-[11px] text-slate-300 truncate">
+                    {selectedBook.authors.length > 0
+                      ? selectedBook.authors.join(', ')
+                      : 'Unknown Author'}
+                    {selectedBook.firstPublishYear ? ` · ${selectedBook.firstPublishYear}` : ''}
+                  </p>
                 </div>
-                <p className="font-editorial font-semibold text-xs sm:text-sm text-white truncate">
-                  {selectedBook.title}
-                </p>
-                <p className="text-[11px] text-slate-300 truncate">
-                  {selectedBook.authors.length > 0
-                    ? selectedBook.authors.join(', ')
-                    : 'Unknown Author'}
-                  {selectedBook.firstPublishYear ? ` · ${selectedBook.firstPublishYear}` : ''}
-                </p>
+                <button
+                  type="button"
+                  onClick={onClearBook}
+                  aria-label="Clear selected book and return to general book-discovery chat"
+                  title="Clear selection"
+                  className="shrink-0 inline-flex items-center gap-1 rounded-lg border border-purple-400/30 bg-[#070B1E]/80 px-2 py-1 text-[11px] font-semibold text-purple-100 hover:border-pink-400/60 hover:text-white transition"
+                >
+                  <X className="w-3 h-3" />
+                  <span>Clear</span>
+                </button>
               </div>
-              <button
-                type="button"
-                onClick={onClearBook}
-                aria-label="Clear selected book and return to general book-discovery chat"
-                title="Clear selection"
-                className="shrink-0 inline-flex items-center gap-1 rounded-lg border border-purple-400/30 bg-[#070B1E]/80 px-2 py-1 text-[11px] font-semibold text-purple-100 hover:border-pink-400/60 hover:text-white transition"
-              >
-                <X className="w-3 h-3" />
-                <span>Clear</span>
-              </button>
+              {selectedBook.description && (
+                <p className="text-[11px] leading-snug text-slate-300/90 line-clamp-2 border-t border-purple-400/20 pt-1.5">
+                  {selectedBook.description}
+                </p>
+              )}
             </div>
           ) : (
             <div className="rounded-xl border border-purple-500/25 bg-[#070B1E]/70 px-3 py-2 flex items-center gap-2 text-[11px] text-slate-300">

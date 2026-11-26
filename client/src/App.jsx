@@ -24,6 +24,7 @@ export default function App() {
 
   // Active book & floating chat state
   const [selectedBook, setSelectedBook] = useState(null);
+  const [isLoadingSynopsis, setIsLoadingSynopsis] = useState(false);
   const [isChatOpen, setIsChatOpen] = useState(false);
   const [isManualModalOpen, setIsManualModalOpen] = useState(false);
   const [threads, setThreads] = useState({});
@@ -33,6 +34,7 @@ export default function App() {
   const [lastFailedPrompt, setLastFailedPrompt] = useState('');
 
   const searchAbortRef = useRef(null);
+  const synopsisAbortRef = useRef(null);
 
   const activeThreadKey = selectedBook ? selectedBook.id : GENERAL_THREAD_KEY;
   const activeMessages = threads[activeThreadKey] || [];
@@ -76,6 +78,7 @@ export default function App() {
   useEffect(() => {
     return () => {
       searchAbortRef.current?.abort();
+      synopsisAbortRef.current?.abort();
     };
   }, []);
 
@@ -92,12 +95,56 @@ export default function App() {
     runSearch(term, 'all');
   };
 
+  const enrichBookSynopsis = useCallback(async (book) => {
+    synopsisAbortRef.current?.abort();
+
+    if (!book || book.description?.trim() || book.source === 'manual') {
+      setIsLoadingSynopsis(false);
+      return;
+    }
+
+    const controller = new AbortController();
+    synopsisAbortRef.current = controller;
+    setIsLoadingSynopsis(true);
+
+    try {
+      const params = new URLSearchParams();
+      if (book.workKey) params.set('workKey', book.workKey);
+      if (book.title) params.set('title', book.title);
+      if (book.authors?.[0]) params.set('author', book.authors[0]);
+
+      const response = await fetch(`/api/book-details?${params.toString()}`, {
+        signal: controller.signal,
+      });
+      if (!response.ok) return;
+
+      const data = await response.json();
+      if (data?.description) {
+        setSelectedBook((prev) =>
+          prev?.id === book.id ? { ...prev, description: data.description } : prev
+        );
+        setBooks((prevBooks) =>
+          prevBooks.map((item) =>
+            item.id === book.id ? { ...item, description: data.description } : item
+          )
+        );
+      }
+    } catch (err) {
+      if (err?.name === 'AbortError') return;
+    } finally {
+      if (synopsisAbortRef.current === controller) {
+        setIsLoadingSynopsis(false);
+      }
+    }
+  }, []);
+
   const handleSelectBook = (book) => {
     setSelectedBook((prev) => (prev?.id === book.id ? prev : book));
     setChatError('');
     setLastFailedPrompt('');
     // Automatically summon the Floating Astronaut Chat Popup on book selection
     setIsChatOpen(true);
+    enrichBookSynopsis(book);
   };
 
   const handleManualBookSubmit = (manualBook) => {
@@ -106,6 +153,8 @@ export default function App() {
   };
 
   const handleClearBook = () => {
+    synopsisAbortRef.current?.abort();
+    setIsLoadingSynopsis(false);
     setSelectedBook(null);
     setChatError('');
     setLastFailedPrompt('');
@@ -158,6 +207,7 @@ export default function App() {
             .map((m) => ({ role: m.role, text: m.text })),
           book: selectedBook
             ? {
+                workKey: selectedBook.workKey || null,
                 title: selectedBook.title,
                 authors: selectedBook.authors,
                 firstPublishYear: selectedBook.firstPublishYear,
@@ -278,6 +328,7 @@ export default function App() {
         onToggle={() => setIsChatOpen((prev) => !prev)}
         onClose={() => setIsChatOpen(false)}
         selectedBook={selectedBook}
+        isLoadingSynopsis={isLoadingSynopsis}
         onClearBook={handleClearBook}
         messages={activeMessages}
         input={chatInput}

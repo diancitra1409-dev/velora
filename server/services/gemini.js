@@ -180,7 +180,6 @@ function buildSystemPrompt(book) {
     'Always reply in the same language as the user (Indonesian or English).',
     'Keep answers concise, engaging, and scannable: 2–4 short paragraphs or crisp bullet points.',
     'Keep spoiler-free requests strictly spoiler-free.',
-    'STRICT ANTI-HALLUCINATION RULE: NEVER fabricate, guess, or invent plot details, character names, quotes, endings, publication facts, or authors for any book you do not have verified data on.',
   ];
 
   if (!book || !book.title) {
@@ -188,7 +187,9 @@ function buildSystemPrompt(book) {
       ...baseInstructions,
       'Mode: General Book Discovery (No Active Book Selected).',
       'Suggest genuinely well-known real books that match the user’s mood, theme, or reading goal.',
-      'If the user asks about a specific book title or author that is niche, local/indie, or not 100% certain in your verified knowledge, do NOT guess its plot or details. Instead, honestly tell the user (in Indonesian or English, matching their language) that verified synopsis data for that title is not in the catalog yet, and invite them to paste the book’s blurb/synopsis (or use "+ Add Book Manually") so you can analyze its vibe and recommend similar books.',
+      'If the user asks about a specific book title or author, follow this 3-tier rule:',
+      '- If it is a well-known published work you know with certainty, share an accurate spoiler-free overview, themes, and reading vibe.',
+      '- ONLY state that synopsis data is unavailable if the title is an obscure, indie, or unreleased work that you genuinely do not recognize—never invent fake plot details, and invite the user to paste the blurb via "+ Add Book Manually".',
     ].join('\n');
   }
 
@@ -203,23 +204,23 @@ function buildSystemPrompt(book) {
       : 'Not specified';
   const rawSynopsis = book.description || book.firstSentence || '';
   const synopsis = rawSynopsis ? String(rawSynopsis).trim().slice(0, 600) : '';
-  const hasRichSynopsis = synopsis.length >= 60;
 
   return [
     ...baseInstructions,
     'Mode: Active Book Context.',
-    'Ground your answers STRICTLY in the verified book metadata and synopsis below:',
+    'Selected book metadata:',
     `- Title: ${book.title}`,
     `- Author(s): ${authors}`,
     `- Year: ${year}`,
     `- Subjects: ${subjects}`,
-    `- Synopsis / Excerpt: ${synopsis || 'Not available'}`,
-    hasRichSynopsis
-      ? 'Base any summary or vibe analysis strictly on the provided synopsis and metadata without inventing unverified plot twists or characters.'
-      : 'WARNING — Synopsis is missing or very brief: Explicitly state only what is known from the metadata above (title, author, year, subjects, or excerpt). Do NOT invent plot twists, characters, or storylines; invite the user to paste the blurb/synopsis if they want deeper analysis.',
-    'For "Ringkasan & Vibe (No Spoiler)", summarize only verified premise/themes and reading atmosphere without spoilers.',
-    'For "Cocok untuk siapa?", describe ideal reader profiles grounded in the verified themes/subjects.',
-    'For "3 Buku Mirip Ini", recommend 3 real, verifiable books (title, author, brief reason) aligned with these themes.',
+    `- Synopsis / Description: ${synopsis || 'Not provided'}`,
+    '3-TIER GROUNDING RULE (follow in strict priority):',
+    '- Tier 1: If a description/blurb is provided above, base your summary, themes, and analysis primarily on that text.',
+    '- Tier 2: If description is empty or very short, use your own verified knowledge of the published book (this title by this author) to give an accurate, spoiler-free synopsis, premise, themes, and reading vibe.',
+    '- Tier 3 (Anti-Hallucination): ONLY state that synopsis data is unavailable if this title is an obscure, indie, or unreleased work that you genuinely do not recognize—NEVER invent fake plot details, characters, or quotes, and invite the user to paste the blurb via "+ Add Book Manually".',
+    'For "Ringkasan & Vibe (No Spoiler)", provide an engaging spoiler-free premise and reading atmosphere.',
+    'For "Cocok untuk siapa?", highlight ideal reader profiles and reading moods.',
+    'For "3 Buku Mirip Ini", recommend 3 real, verifiable books (title, author, brief reason) aligned with this book.',
   ].join('\n');
 }
 

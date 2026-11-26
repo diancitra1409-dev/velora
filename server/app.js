@@ -1,5 +1,6 @@
 import cors from 'cors';
 import express from 'express';
+import { fetchBookSynopsis } from './services/bookDetails.js';
 import { generateBookAssistantReply, getCachedModel } from './services/gemini.js';
 
 const app = express();
@@ -25,6 +26,24 @@ apiRouter.get('/health', (_req, res) => {
   });
 });
 
+apiRouter.get('/book-details', async (req, res) => {
+  const workKey = typeof req.query.workKey === 'string' ? req.query.workKey : '';
+  const title = typeof req.query.title === 'string' ? req.query.title : '';
+  const author = typeof req.query.author === 'string' ? req.query.author : '';
+
+  if (!workKey && !title) {
+    return res.status(400).json({
+      error: {
+        code: 400,
+        message: 'Provide workKey or title to fetch book details.',
+      },
+    });
+  }
+
+  const result = await fetchBookSynopsis({ workKey, title, author });
+  return res.json(result);
+});
+
 apiRouter.post('/chat', async (req, res) => {
   const { message, history, book } = req.body || {};
 
@@ -47,10 +66,22 @@ apiRouter.post('/chat', async (req, res) => {
   }
 
   try {
+    let enrichedBook = book && typeof book === 'object' ? { ...book } : null;
+    if (enrichedBook && enrichedBook.title && !String(enrichedBook.description || '').trim()) {
+      const details = await fetchBookSynopsis({
+        workKey: enrichedBook.workKey,
+        title: enrichedBook.title,
+        author: Array.isArray(enrichedBook.authors) ? enrichedBook.authors[0] : '',
+      });
+      if (details.description) {
+        enrichedBook.description = details.description;
+      }
+    }
+
     const result = await generateBookAssistantReply({
       message,
       history: Array.isArray(history) ? history : [],
-      book: book && typeof book === 'object' ? book : null,
+      book: enrichedBook,
     });
 
     return res.json({
