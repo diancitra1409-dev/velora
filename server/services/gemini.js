@@ -1,24 +1,22 @@
 import { GoogleGenAI } from '@google/genai';
 
-const PRIMARY_MODEL = 'gemini-3.8-flash';
-const FAST_RETRY_DELAY_MS = 400;
-const REQUEST_TIMEOUT_MS = 3500;
-const MAX_OUTPUT_TOKENS = 450;
+const MODEL_PRIORITY = [
+  'gemini-2.5-flash-lite',
+  'gemini-2.5-flash',
+  'gemini-3.8-flash',
+  'gemma-3-27b-it',
+];
+
+const MODEL_TIMEOUT_MS = 4000;
+const MAX_OUTPUT_TOKENS = 400;
 
 // Cached in memory across warm invocations (local Express & Vercel serverless)
-let cachedWorkingModel = PRIMARY_MODEL;
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+let cachedWorkingModel = null;
 
 export function getCachedModel() {
-  return cachedWorkingModel;
+  return cachedWorkingModel || MODEL_PRIORITY[0];
 }
 
-/**
- * Extract numeric HTTP status code or timeout signal from @google/genai errors.
- */
 function extractStatusCode(err) {
   if (!err) return null;
   if (err.isTimeout || err.name === 'AbortError' || err.name === 'TimeoutError') {
@@ -47,9 +45,19 @@ function isThinkingUnsupportedError(err) {
   );
 }
 
-/**
- * Extract a clean, non-JSON error message suitable for API responses.
- */
+function isSystemInstructionUnsupportedError(err) {
+  const status = extractStatusCode(err);
+  const msg = String(err?.message || '').toLowerCase();
+  return (
+    status === 400 &&
+    (msg.includes('developer instruction') || msg.includes('system instruction') || msg.includes('systeminstruction'))
+  );
+}
+
+function shouldTryNextModel(status) {
+  return status === 504 || status === 503 || status === 429 || status === 404;
+}
+
 function extractCleanErrorMessage(err) {
   const raw = String(err?.message || '').trim();
   if (!raw) return 'Unable to generate a response from the AI assistant.';
@@ -78,75 +86,6 @@ function extractCleanErrorMessage(err) {
   return raw;
 }
 
-function isModelFailureForFallback(status) {
-  return status === 503 || status === 429 || status === 404 || status === 504;
-}
-
-/**
- * Normalize model resource names (e.g., "models/gemini-2.5-flash" -> "gemini-2.5-flash").
- */
-function normalizeModelId(name = '') {
-  return name.replace(/^models\//, '').trim();
-}
-
-/**
- * Discover alternative flash-lite / flash models dynamically via ai.models.list().
- */
-async function discoverFallbackModels(ai, excludeModels) {
-  const candidates = [];
-  try {
-    const pager = await ai.models.list({ config: { pageSize: 50 } });
-    let count = 0;
-    for await (const model of pager) {
-      count += 1;
-      const id = normalizeModelId(model?.name || '');
-      if (!id || excludeModels.has(id)) continue;
-
-      const lower = id.toLowerCase();
-      const isFlashFamily = lower.includes('flash');
-      const isSpecializedNonChat =
-        lower.includes('tts') ||
-        lower.includes('image') ||
-        lower.includes('audio') ||
-        lower.includes('live') ||
-        lower.includes('computer-use') ||
-        lower.includes('embedding');
-
-      const supportsGenerate =
-        !Array.isArray(model.supportedActions) ||
-        model.supportedActions.includes('generateContent');
-
-      if (isFlashFamily && !isSpecializedNonChat && supportsGenerate) {
-        candidates.push(id);
-      }
-
-      if (count >= 60) break;
-    }
-  } catch (listErr) {
-    console.warn('[Velora] Failed to list fallback models:', listErr?.message || listErr);
-  }
-
-  // Prioritize fast flash-lite and stable flash models
-  candidates.sort((a, b) => {
-    const score = (id) => {
-      let s = 0;
-      if (id.includes('flash-lite')) s += 40;
-      else if (id.endsWith('flash')) s += 30;
-      if (id.includes('2.5')) s += 20;
-      else if (id.includes('3.')) s += 15;
-      else if (id.includes('2.0')) s += 10;
-      if (id.includes('preview')) s -= 2;
-      return s;
-    };
-    return score(b) - score(a);
-  });
-
-  return candidates;
-}
-
-/**
- * Build strict anti-hallucination system prompt with compact book metadata (top 5 subjects, max 600 chars synopsis).
- */
 function buildSystemPrompt(book) {
   const baseInstructions = [
     'You are Velora, an honest, warm, and insightful literary assistant.',
@@ -196,9 +135,6 @@ function buildSystemPrompt(book) {
   ].join('\n');
 }
 
-/**
- * Keep only the last 4 chat messages for low-latency context.
- */
 function buildContents(history = [], message) {
   const contents = [];
   if (Array.isArray(history)) {
@@ -217,23 +153,33 @@ function buildContents(history = [], message) {
   return contents;
 }
 
+function buildContentsWithInlineSystem(systemInstruction, history, message) {
+  const base = buildContents(history, message);
+  const firstUser = base[0];
+  if (firstUser && firstUser.role === 'user') {
+    firstUser.parts = [
+      { text: `Instructions:\n${systemInstruction}\n\nUser request:\n${firstUser.parts[0].text}` },
+    ];
+  }
+  return base;
+}
+
 /**
- * Execute a single generateContent call bounded by REQUEST_TIMEOUT_MS,
- * safely stripping thinkingConfig if a fallback model does not support it.
+ * Call a single model with a strict 4000ms timeout (AbortSignal.timeout(4000)),
+ * safely stripping thinkingConfig or folding systemInstruction if unsupported.
  */
-async function callWithTimeout(ai, model, contents, baseConfig, timeoutMs = REQUEST_TIMEOUT_MS) {
-  const invoke = async (configObj) => {
-    const controller = new AbortController();
+async function callModelWithTimeout(ai, model, systemInstruction, history, message) {
+  const invoke = async ({ contents, config }) => {
+    const timeoutSignal = AbortSignal.timeout(MODEL_TIMEOUT_MS);
     let timerId;
 
     const timeoutPromise = new Promise((_, reject) => {
       timerId = setTimeout(() => {
-        controller.abort();
-        const timeoutErr = new Error(`Model ${model} timed out after ${timeoutMs}ms`);
+        const timeoutErr = new Error(`Model ${model} timed out after ${MODEL_TIMEOUT_MS}ms`);
         timeoutErr.isTimeout = true;
         timeoutErr.status = 504;
         reject(timeoutErr);
-      }, timeoutMs);
+      }, MODEL_TIMEOUT_MS);
     });
 
     try {
@@ -241,8 +187,8 @@ async function callWithTimeout(ai, model, contents, baseConfig, timeoutMs = REQU
         model,
         contents,
         config: {
-          ...configObj,
-          abortSignal: controller.signal,
+          ...config,
+          abortSignal: timeoutSignal,
         },
       });
       const response = await Promise.race([apiPromise, timeoutPromise]);
@@ -256,96 +202,72 @@ async function callWithTimeout(ai, model, contents, baseConfig, timeoutMs = REQU
     }
   };
 
-  try {
-    return await invoke(baseConfig);
-  } catch (err) {
-    if (isThinkingUnsupportedError(err) && baseConfig.thinkingConfig) {
-      const { thinkingConfig: _removed, ...withoutThinking } = baseConfig;
-      return await invoke(withoutThinking);
+  let currentContents = buildContents(history, message);
+  let currentConfig = {
+    systemInstruction,
+    temperature: 0.7,
+    maxOutputTokens: MAX_OUTPUT_TOKENS,
+    ...(model.startsWith('gemma-') ? {} : { thinkingConfig: { thinkingBudget: 0 } }),
+  };
+
+  for (let pass = 0; pass < 3; pass += 1) {
+    try {
+      return await invoke({ contents: currentContents, config: currentConfig });
+    } catch (err) {
+      if (isThinkingUnsupportedError(err) && currentConfig.thinkingConfig) {
+        const { thinkingConfig: _removed, ...rest } = currentConfig;
+        currentConfig = rest;
+        continue;
+      }
+      if (isSystemInstructionUnsupportedError(err) && currentConfig.systemInstruction) {
+        const { systemInstruction: sys, ...rest } = currentConfig;
+        currentConfig = rest;
+        currentContents = buildContentsWithInlineSystem(sys, history, message);
+        continue;
+      }
+      throw err;
     }
-    throw err;
   }
 }
 
 /**
- * Try a model with at most 1 fast retry (400ms delay) on 503/429 (not on stall/timeout).
- */
-async function generateFast(ai, model, contents, baseConfig) {
-  try {
-    return await callWithTimeout(ai, model, contents, baseConfig, REQUEST_TIMEOUT_MS);
-  } catch (firstErr) {
-    const status = extractStatusCode(firstErr);
-    // If it stalled (504) or isn't 503/429, fail immediately so fallback triggers right away
-    if (status !== 503 && status !== 429) {
-      throw firstErr;
-    }
-    await sleep(FAST_RETRY_DELAY_MS);
-    return await callWithTimeout(ai, model, contents, baseConfig, REQUEST_TIMEOUT_MS);
-  }
-}
-
-/**
- * Generate a fast literary assistant reply with immediate fallback & module-level model caching.
+ * Generate an AI reply using fast-first model priority without extra network calls.
  */
 export async function generateBookAssistantReply({ message, history, book }) {
   const apiKey = (process.env.GEMINI_API_KEY || '').trim();
   if (!apiKey || apiKey === 'your_gemini_api_key_here') {
-    const configError = new Error(
-      'GEMINI_API_KEY is not configured. Add a valid key to your .env or Vercel environment variables.'
-    );
+    const configError = new Error('GEMINI_API_KEY is missing in environment variables.');
     configError.status = 500;
+    configError.isMissingApiKey = true;
     throw configError;
   }
 
   const ai = new GoogleGenAI({ apiKey });
-  const contents = buildContents(history, message);
-  const baseConfig = {
-    systemInstruction: buildSystemPrompt(book),
-    temperature: 0.7,
-    maxOutputTokens: MAX_OUTPUT_TOKENS,
-    thinkingConfig: { thinkingBudget: 0 },
-  };
+  const systemInstruction = buildSystemPrompt(book);
 
-  const triedModels = new Set();
-  const activeModel = cachedWorkingModel || PRIMARY_MODEL;
-  triedModels.add(activeModel);
+  const orderedModels = cachedWorkingModel
+    ? [cachedWorkingModel, ...MODEL_PRIORITY.filter((m) => m !== cachedWorkingModel)]
+    : [...MODEL_PRIORITY];
 
-  try {
-    const reply = await generateFast(ai, activeModel, contents, baseConfig);
-    cachedWorkingModel = activeModel;
-    return { reply, model: activeModel };
-  } catch (primaryErr) {
-    const primaryStatus = extractStatusCode(primaryErr);
-
-    if (!isModelFailureForFallback(primaryStatus)) {
-      const err = new Error(extractCleanErrorMessage(primaryErr));
-      err.status = primaryStatus || 500;
-      throw err;
-    }
-
-    // Immediately discover and switch to an available flash-lite / flash model
-    const fallbacks = await discoverFallbackModels(ai, triedModels);
-    let lastFallbackErr = primaryErr;
-
-    for (const fallbackModel of fallbacks.slice(0, 2)) {
-      triedModels.add(fallbackModel);
-      try {
-        const reply = await generateFast(ai, fallbackModel, contents, baseConfig);
-        // Cache working fallback so subsequent requests skip gemini-3.8-flash
-        cachedWorkingModel = fallbackModel;
-        return { reply, model: fallbackModel };
-      } catch (fallbackErr) {
-        lastFallbackErr = fallbackErr;
-        const fbStatus = extractStatusCode(fallbackErr);
-        if (!isModelFailureForFallback(fbStatus)) {
-          break;
-        }
+  let lastErr;
+  for (const model of orderedModels) {
+    try {
+      const reply = await callModelWithTimeout(ai, model, systemInstruction, history, message);
+      cachedWorkingModel = model;
+      return { reply, model };
+    } catch (err) {
+      lastErr = err;
+      const status = extractStatusCode(err);
+      if (!shouldTryNextModel(status)) {
+        const cleanErr = new Error(extractCleanErrorMessage(err));
+        cleanErr.status = status || 500;
+        throw cleanErr;
       }
     }
-
-    const finalStatus = extractStatusCode(lastFallbackErr) || primaryStatus || 503;
-    const finalErr = new Error(extractCleanErrorMessage(lastFallbackErr));
-    finalErr.status = finalStatus >= 400 && finalStatus < 600 ? finalStatus : 503;
-    throw finalErr;
   }
+
+  const finalStatus = extractStatusCode(lastErr) || 503;
+  const finalErr = new Error(extractCleanErrorMessage(lastErr));
+  finalErr.status = finalStatus >= 400 && finalStatus < 600 ? finalStatus : 503;
+  throw finalErr;
 }

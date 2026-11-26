@@ -58,6 +58,12 @@ apiRouter.post('/chat', async (req, res) => {
       model: result.model,
     });
   } catch (err) {
+    if (err?.isMissingApiKey) {
+      return res.status(500).json({
+        error: 'GEMINI_API_KEY is missing in environment variables.',
+      });
+    }
+
     const status = typeof err?.status === 'number' && err.status >= 400 ? err.status : 500;
     const messageText =
       typeof err?.message === 'string' && err.message.trim()
