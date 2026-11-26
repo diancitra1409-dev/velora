@@ -1,20 +1,37 @@
 import { GoogleGenAI } from '@google/genai';
 
-const MODEL_PRIORITY = [
-  'gemini-2.5-flash-lite',
-  'gemini-2.5-flash',
-  'gemini-3.8-flash',
-  'gemma-3-27b-it',
+const MODEL_TIMEOUT_MS = 7500;
+const MAX_OUTPUT_TOKENS = 450;
+
+const EXCLUDED_MODEL_TOKENS = [
+  'gemma',
+  'embedding',
+  'imagen',
+  'veo',
+  'tts',
+  'aqa',
+  'robotics',
+  'native-audio',
+  'computer-use',
+  '-image',
 ];
 
-const MODEL_TIMEOUT_MS = 4000;
-const MAX_OUTPUT_TOKENS = 400;
+const FALLBACK_SEED_MODELS = [
+  'gemini-2.5-flash-lite',
+  'gemini-2.5-flash',
+  'gemini-2.0-flash',
+];
 
-// Cached in memory across warm invocations (local Express & Vercel serverless)
+// Cached in module memory across warm invocations (local Express & Vercel serverless)
+let cachedDiscoveredModels = null;
 let cachedWorkingModel = null;
 
 export function getCachedModel() {
-  return cachedWorkingModel || MODEL_PRIORITY[0];
+  return cachedWorkingModel || cachedDiscoveredModels?.[0] || FALLBACK_SEED_MODELS[0];
+}
+
+function normalizeModelId(name = '') {
+  return String(name).replace(/^models\//, '').trim();
 }
 
 function extractStatusCode(err) {
@@ -34,24 +51,6 @@ function extractStatusCode(err) {
   if (/\b400\b|INVALID_ARGUMENT/i.test(msg)) return 400;
   if (/\b401\b|\b403\b|API_KEY_INVALID|PERMISSION_DENIED/i.test(msg)) return 401;
   return null;
-}
-
-function isThinkingUnsupportedError(err) {
-  const status = extractStatusCode(err);
-  const msg = String(err?.message || '').toLowerCase();
-  return (
-    status === 400 &&
-    (msg.includes('thinking') || msg.includes('thinkingbudget') || msg.includes('thinking_config'))
-  );
-}
-
-function isSystemInstructionUnsupportedError(err) {
-  const status = extractStatusCode(err);
-  const msg = String(err?.message || '').toLowerCase();
-  return (
-    status === 400 &&
-    (msg.includes('developer instruction') || msg.includes('system instruction') || msg.includes('systeminstruction'))
-  );
 }
 
 function shouldTryNextModel(status) {
@@ -84,6 +83,95 @@ function extractCleanErrorMessage(err) {
   }
 
   return raw;
+}
+
+function parseVersionScore(modelId) {
+  const match = modelId.match(/gemini-(\d+)(?:\.(\d+))?/i);
+  if (!match) return 0;
+  const major = Number(match[1]) || 0;
+  const minor = Number(match[2]) || 0;
+  return major * 10 + minor;
+}
+
+function scoreModelPriority(modelId) {
+  const lower = modelId.toLowerCase();
+  let score = 0;
+
+  if (lower.includes('flash-lite')) {
+    score += 3000;
+  } else if (lower.includes('flash')) {
+    score += 2000;
+  } else if (lower.includes('pro')) {
+    score += 500;
+  } else {
+    score += 1000;
+  }
+
+  score += parseVersionScore(lower);
+
+  // Slightly prefer stable aliases over preview/experimental/dated snapshots
+  if (lower.includes('preview') || lower.includes('exp')) {
+    score -= 5;
+  }
+  if (/-\d{3,}$/.test(lower) || /-\d{2}-\d{2}/.test(lower)) {
+    score -= 3;
+  }
+
+  return score;
+}
+
+/**
+ * Filter & sort live models from ai.models.list():
+ * Keep ONLY `gemini-` models supporting `generateContent`, excluding non-chat models,
+ * and sort flash-lite / flash variants ahead of pro models.
+ */
+export function filterAndSortGeminiModels(rawModels = []) {
+  const uniqueIds = new Set();
+
+  for (const model of rawModels) {
+    const id = normalizeModelId(model?.name || '');
+    if (!id) continue;
+
+    const lower = id.toLowerCase();
+    if (!lower.includes('gemini-')) continue;
+
+    const hasExcludedToken = EXCLUDED_MODEL_TOKENS.some((tok) => lower.includes(tok));
+    if (hasExcludedToken) continue;
+
+    const supportsGenerateContent =
+      Array.isArray(model?.supportedActions) &&
+      model.supportedActions.includes('generateContent');
+    if (!supportsGenerateContent) continue;
+
+    uniqueIds.add(id);
+  }
+
+  return Array.from(uniqueIds).sort((a, b) => scoreModelPriority(b) - scoreModelPriority(a));
+}
+
+async function getDiscoveredModels(ai) {
+  if (Array.isArray(cachedDiscoveredModels) && cachedDiscoveredModels.length > 0) {
+    return cachedDiscoveredModels;
+  }
+
+  const collected = [];
+  try {
+    const pager = await ai.models.list({ config: { pageSize: 100 } });
+    for await (const model of pager) {
+      collected.push(model);
+      if (collected.length >= 150) break;
+    }
+
+    const filtered = filterAndSortGeminiModels(collected);
+    if (filtered.length > 0) {
+      cachedDiscoveredModels = filtered;
+      return filtered;
+    }
+  } catch (listErr) {
+    console.warn('[Velora] ai.models.list() failed, using fallback seed list:', listErr?.message || listErr);
+  }
+
+  return [...FALLBACK_SEED_MODELS];
 }
 
 function buildSystemPrompt(book) {
@@ -153,85 +241,46 @@ function buildContents(history = [], message) {
   return contents;
 }
 
-function buildContentsWithInlineSystem(systemInstruction, history, message) {
-  const base = buildContents(history, message);
-  const firstUser = base[0];
-  if (firstUser && firstUser.role === 'user') {
-    firstUser.parts = [
-      { text: `Instructions:\n${systemInstruction}\n\nUser request:\n${firstUser.parts[0].text}` },
-    ];
-  }
-  return base;
-}
-
 /**
- * Call a single model with a strict 4000ms timeout (AbortSignal.timeout(4000)),
- * safely stripping thinkingConfig or folding systemInstruction if unsupported.
+ * Call a single Gemini model bounded by a 7500ms timeout without thinkingConfig.
  */
 async function callModelWithTimeout(ai, model, systemInstruction, history, message) {
-  const invoke = async ({ contents, config }) => {
-    const timeoutSignal = AbortSignal.timeout(MODEL_TIMEOUT_MS);
-    let timerId;
+  const timeoutSignal = AbortSignal.timeout(MODEL_TIMEOUT_MS);
+  let timerId;
 
-    const timeoutPromise = new Promise((_, reject) => {
-      timerId = setTimeout(() => {
-        const timeoutErr = new Error(`Model ${model} timed out after ${MODEL_TIMEOUT_MS}ms`);
-        timeoutErr.isTimeout = true;
-        timeoutErr.status = 504;
-        reject(timeoutErr);
-      }, MODEL_TIMEOUT_MS);
+  const timeoutPromise = new Promise((_, reject) => {
+    timerId = setTimeout(() => {
+      const timeoutErr = new Error(`Model ${model} timed out after ${MODEL_TIMEOUT_MS}ms`);
+      timeoutErr.isTimeout = true;
+      timeoutErr.status = 504;
+      reject(timeoutErr);
+    }, MODEL_TIMEOUT_MS);
+  });
+
+  try {
+    const apiPromise = ai.models.generateContent({
+      model,
+      contents: buildContents(history, message),
+      config: {
+        systemInstruction,
+        temperature: 0.7,
+        maxOutputTokens: MAX_OUTPUT_TOKENS,
+        abortSignal: timeoutSignal,
+      },
     });
-
-    try {
-      const apiPromise = ai.models.generateContent({
-        model,
-        contents,
-        config: {
-          ...config,
-          abortSignal: timeoutSignal,
-        },
-      });
-      const response = await Promise.race([apiPromise, timeoutPromise]);
-      const text = response?.text?.trim();
-      if (!text) {
-        throw new Error('Gemini returned an empty response.');
-      }
-      return text;
-    } finally {
-      clearTimeout(timerId);
+    const response = await Promise.race([apiPromise, timeoutPromise]);
+    const text = response?.text?.trim();
+    if (!text) {
+      throw new Error('Gemini returned an empty response.');
     }
-  };
-
-  let currentContents = buildContents(history, message);
-  let currentConfig = {
-    systemInstruction,
-    temperature: 0.7,
-    maxOutputTokens: MAX_OUTPUT_TOKENS,
-    ...(model.startsWith('gemma-') ? {} : { thinkingConfig: { thinkingBudget: 0 } }),
-  };
-
-  for (let pass = 0; pass < 3; pass += 1) {
-    try {
-      return await invoke({ contents: currentContents, config: currentConfig });
-    } catch (err) {
-      if (isThinkingUnsupportedError(err) && currentConfig.thinkingConfig) {
-        const { thinkingConfig: _removed, ...rest } = currentConfig;
-        currentConfig = rest;
-        continue;
-      }
-      if (isSystemInstructionUnsupportedError(err) && currentConfig.systemInstruction) {
-        const { systemInstruction: sys, ...rest } = currentConfig;
-        currentConfig = rest;
-        currentContents = buildContentsWithInlineSystem(sys, history, message);
-        continue;
-      }
-      throw err;
-    }
+    return text;
+  } finally {
+    clearTimeout(timerId);
   }
 }
 
 /**
- * Generate an AI reply using fast-first model priority without extra network calls.
+ * Generate an AI reply using cached live Gemini model discovery and fast flash-first ordering.
  */
 export async function generateBookAssistantReply({ message, history, book }) {
   const apiKey = (process.env.GEMINI_API_KEY || '').trim();
@@ -244,13 +293,14 @@ export async function generateBookAssistantReply({ message, history, book }) {
 
   const ai = new GoogleGenAI({ apiKey });
   const systemInstruction = buildSystemPrompt(book);
+  const discoveredModels = await getDiscoveredModels(ai);
 
   const orderedModels = cachedWorkingModel
-    ? [cachedWorkingModel, ...MODEL_PRIORITY.filter((m) => m !== cachedWorkingModel)]
-    : [...MODEL_PRIORITY];
+    ? [cachedWorkingModel, ...discoveredModels.filter((m) => m !== cachedWorkingModel)]
+    : discoveredModels;
 
   let lastErr;
-  for (const model of orderedModels) {
+  for (const model of orderedModels.slice(0, 5)) {
     try {
       const reply = await callModelWithTimeout(ai, model, systemInstruction, history, message);
       cachedWorkingModel = model;
